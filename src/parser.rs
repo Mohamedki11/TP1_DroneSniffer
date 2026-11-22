@@ -5,10 +5,6 @@
 
 use serde::Serialize;
 
-/// OUI identifiant les trames DroneID françaises (6A:5C:35)
-/// Défini par l'arrêté publié au Journal Officiel
-pub const DRONE_OUI: [u8; 3] = [0x6A, 0x5C, 0x35];
-
 /// Données extraites d'une trame beacon DroneID
 #[derive(Debug, Serialize)]
 pub struct DroneFrame {
@@ -82,28 +78,22 @@ pub fn parse_beacon_frame(data: &[u8]) -> Option<BeaconFrame> {
     Some(BeaconFrame { ssid, mac })
 }
 
-/// Parcourt les paramètres TLV à la recherche du tag Vendor Specific (221)
-/// contenant l'OUI DroneID français (6A:5C:35)
+/// Décode le tag Vendor Specific (221) DroneID français (6A:5C:35)
+/// avec remoteid::france (valeurs big-endian, arrêté du 27 décembre 2019)
 fn find_drone_tag(data: &[u8]) -> Option<DroneFrame> {
-    let mut i = 0;
-    while i + 2 <= data.len() {
-        let tag_id  = data[i];
-        let tag_len = data[i + 1] as usize;
-        let tag_end = i + 2 + tag_len;
-
-        // Vérification des limites pour éviter une lecture hors buffer
-        if tag_end > data.len() { break; }
-
-        // 0xDD = 221 = tag Vendor Specific
-        if tag_id == 0xDD {
-            let tag_data = &data[i + 2..tag_end];
-            if tag_data.get(0..3) == Some(&DRONE_OUI) {
-                return parse_drone_payload(tag_data);
-            }
-        }
-        i = tag_end;
-    }
-    None
+    let b = remoteid::france::find_in_elements(data)?;
+    let drone_id = b.identifier_str()?.trim().to_string();
+    if drone_id.is_empty() { return None; }
+    Some(DroneFrame {
+        drone_id,
+        mac:       String::new(), // rempli plus tard par parse_drone_frame
+        ssid:      String::new(), // rempli plus tard par parse_drone_frame
+        latitude:  b.latitude.unwrap_or(0.0) as f32,
+        longitude: b.longitude.unwrap_or(0.0) as f32,
+        altitude:  b.altitude.unwrap_or(0),
+        speed:     b.horizontal_speed.unwrap_or(0),
+        heading:   b.true_course.unwrap_or(0),
+    })
 }
 
 /// Recherche le tag SSID (type 0x00) dans les paramètres TLV
@@ -126,80 +116,35 @@ fn find_ssid(data: &[u8]) -> Option<String> {
     None
 }
 
-/// Analyse les sous-tags du payload DroneID.
-///
-/// Structure des sous-tags (après OUI 3 octets + type 1 octet) :
-/// - 0x01 : version du protocole
-/// - 0x02 : identifiant du drone (30 octets ASCII)
-/// - 0x04 : latitude  (i32 little-endian, à diviser par 100_000)
-/// - 0x05 : longitude (i32 little-endian, à diviser par 100_000)
-/// - 0x06 : altitude AMSL (i16 little-endian, en mètres)
-/// - 0x0A : vitesse horizontale (u8, en m/s)
-/// - 0x0B : cap (u16 little-endian, en degrés)
-fn parse_drone_payload(data: &[u8]) -> Option<DroneFrame> {
-    let mut drone_id  = String::new();
-    let mac           = String::new(); // rempli plus tard par parse_drone_frame
-    let ssid          = String::new(); // rempli plus tard par parse_drone_frame
-    let mut latitude  = 0.0f32;
-    let mut longitude = 0.0f32;
-    let mut altitude  = 0i16;
-    let mut speed     = 0u8;
-    let mut heading   = 0u16;
+#[cfg(test)]
+mod tests {
+    use super::*;
 
-    // On commence après l'OUI (3 octets) et le type OUI (1 octet)
-    let mut i = 4;
+    #[test]
+    fn decodes_french_beacon_big_endian() {
+        // Valeurs de capture-23-05-08-ttgo.pcapng ; Radiotap (8) + 802.11 (24) + champs fixes (12)
+        let mut pkt = vec![0u8, 0, 8, 0, 0, 0, 0, 0];
+        let mut hdr = vec![0u8; 36];
+        hdr[0] = 0x80;
+        hdr[10..16].copy_from_slice(&[0x24, 0x62, 0xab, 0xdd, 0xb0, 0xbd]);
+        pkt.extend(hdr);
+        pkt.extend([0x00, 4, b'T', b'E', b'S', b'T']);
+        let mut v = vec![0x6A, 0x5C, 0x35, 0x01, 0x01, 1, 1, 0x02, 30];
+        v.extend(b"000ENSEATHESEUS202300000000001");
+        v.extend([0x04, 4]); v.extend(4_918_493i32.to_be_bytes());
+        v.extend([0x05, 4]); v.extend(241_255i32.to_be_bytes());
+        v.extend([0x06, 2]); v.extend(133i16.to_be_bytes());
+        v.extend([0x0A, 1, 7]);
+        v.extend([0x0B, 2]); v.extend(270u16.to_be_bytes());
+        pkt.extend([0xDD, v.len() as u8]);
+        pkt.extend(v);
 
-    while i + 2 <= data.len() {
-        let sub_id  = data[i];
-        let sub_len = data[i + 1] as usize;
-        let start   = i + 2;
-        let end     = start + sub_len;
-        if end > data.len() { break; }
-        let val = &data[start..end];
-
-        match sub_id {
-            0x01 => { /* version — non utilisée */ }
-            0x02 => {
-                // Identifiant drone : chaîne ASCII de 30 octets
-                drone_id = String::from_utf8_lossy(val)
-                    .trim_matches('\0').trim().to_string();
-            }
-            0x04 => {
-                // Latitude : entier signé 32 bits, divisé par 100_000
-                if val.len() >= 4 {
-                    let raw = i32::from_le_bytes(val[0..4].try_into().ok()?);
-                    latitude = raw as f32 / 100_000.0;
-                }
-            }
-            0x05 => {
-                // Longitude : entier signé 32 bits, divisé par 100_000
-                if val.len() >= 4 {
-                    let raw = i32::from_le_bytes(val[0..4].try_into().ok()?);
-                    longitude = raw as f32 / 100_000.0;
-                }
-            }
-            0x06 => {
-                // Altitude AMSL : entier signé 16 bits en mètres
-                if val.len() >= 2 {
-                    altitude = i16::from_le_bytes(val[0..2].try_into().ok()?);
-                }
-            }
-            0x0A => {
-                // Vitesse horizontale : 1 octet non signé
-                if !val.is_empty() { speed = val[0]; }
-            }
-            0x0B => {
-                // Cap : entier non signé 16 bits en degrés
-                if val.len() >= 2 {
-                    heading = u16::from_le_bytes(val[0..2].try_into().ok()?);
-                }
-            }
-            _ => { /* sous-tag inconnu — ignoré sans erreur */ }
-        }
-        i = end;
+        let d = parse_drone_frame(&pkt).unwrap();
+        assert_eq!(d.drone_id, "000ENSEATHESEUS202300000000001");
+        assert!((d.latitude - 49.18493).abs() < 1e-4);
+        assert!((d.longitude - 2.41255).abs() < 1e-4);
+        assert_eq!(d.altitude, 133);
+        assert_eq!(d.speed, 7);
+        assert_eq!(d.heading, 270);
     }
-
-    // On rejette les trames sans identifiant drone
-    if drone_id.is_empty() { return None; }
-    Some(DroneFrame { drone_id, mac, ssid, latitude, longitude, altitude, speed, heading })
 }
